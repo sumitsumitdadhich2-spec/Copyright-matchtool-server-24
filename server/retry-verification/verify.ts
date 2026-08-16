@@ -705,6 +705,103 @@ function rankAlternates(
   return ranked;
 }
 
+/**
+ * RETRY-only candidate assembly. Builds the final ordered candidate list that
+ * recheckSegment hands to verifyOneRange:
+ *
+ *   1. The range's CURRENT pick is always candidate 0 (Gemini re-judges it —
+ *      the previous verdict is never trusted).
+ *   2. Fresh full-movie search results are the candidate source. Only when the
+ *      fresh search is unavailable (fingerprints gone) does the saved engine
+ *      pool serve as fallback — with the same Retry rules applied.
+ *   3. HARD 75% hash floor (RETRY_MIN_CANDIDATE_HASH): any candidate below it
+ *      is DROPPED outright; at/above it, Gemini VLM gets the final say.
+ *   4. Duration rule for pool fallbacks: a candidate whose speed-corrected
+ *      movie span covers < RETRY_MIN_DURATION_RATIO of the target clip's
+ *      duration cannot exist (fresh-search candidates are full-duration by
+ *      construction and were already filtered in fresh-search.ts).
+ *   5. 4-signal tier ordering (structure/color/background/human-edge):
+ *      all 4 > SIGNAL_THRESHOLD → verified FIRST; any signal below it →
+ *      verified LAST; signals unavailable → middle. Hash confidence orders
+ *      within a tier. Signals only filter/rank — Gemini decides.
+ *   6. Near-duplicate movie locations are dropped, and the total list is
+ *      capped at RETRY_MAX_TOTAL_CANDIDATES (20).
+ */
+function buildRetryCandidates(
+  current: MatchedSegment,
+  fresh: FreshCandidate[] | null,
+  pool: MatchedSegment[] | undefined,
+  onLog?: (message: string) => void,
+): RankedCandidate[] {
+  // The current pick is always re-judged by Gemini, never filtered here.
+  const out: RankedCandidate[] = [{ segment: current }];
+  const targetSpan = Math.max(0, current.shortEnd - current.shortStart);
+
+  let source: RankedCandidate[];
+
+  if (fresh) {
+    // Fresh full-movie search results: apply the hard 75% hash floor, then
+    // order by signal tier (all-4-above-threshold first, any-below last).
+    const kept = fresh.filter(c => c.segment.confidence >= RETRY_MIN_CANDIDATE_HASH);
+    if (kept.length !== fresh.length) {
+      onLog?.(
+        `${fresh.length - kept.length} fresh candidate(s) DROPPED below the ` +
+        `${Math.round(RETRY_MIN_CANDIDATE_HASH)}% hash-confidence floor; ` +
+        `${kept.length} go on to Gemini VLM for the final verdict.`,
+      );
+    }
+    kept.sort(
+      (a, b) =>
+        signalTier(a.signals) - signalTier(b.signals) ||
+        b.segment.confidence - a.segment.confidence,
+    );
+    const tier0 = kept.filter(c => signalTier(c.signals) === 0).length;
+    const tier2 = kept.filter(c => signalTier(c.signals) === 2).length;
+    if (kept.length > 0) {
+      onLog?.(
+        `Signal ranking (threshold ${Math.round(SIGNAL_THRESHOLD * 100)}% on all 4 of ` +
+        `structure/color/background/human-edge): ${tier0} top-priority, ` +
+        `${kept.length - tier0 - tier2} neutral, ${tier2} last-priority candidate(s).`,
+      );
+    }
+    source = kept.map((c): RankedCandidate => ({
+      segment: c.segment,
+      retrySignals: c.signals ?? undefined,
+    }));
+  } else {
+    // Fallback ONLY when fingerprints are gone: sweep the engine's saved
+    // full-movie pool with the same Retry rules (duration + 75% hash floor).
+    const rawAlternates = getAlternateCandidatesForRange(
+      pool,
+      current.shortStart,
+      current.shortEnd,
+      [],
+      0.5,
+    );
+    const durationOk = rawAlternates.filter(
+      a => speedCorrectedSpanRatio(a, targetSpan) >= RETRY_MIN_DURATION_RATIO,
+    );
+    const kept = durationOk.filter(a => a.confidence >= RETRY_MIN_CANDIDATE_HASH);
+    onLog?.(
+      `Fresh search unavailable — falling back to the saved candidate pool: ` +
+      `${rawAlternates.length} alternate(s) → ${durationOk.length} after the duration rule ` +
+      `(span >= ${Math.round(RETRY_MIN_DURATION_RATIO * 100)}% of the target clip) → ` +
+      `${kept.length} at/above the ${Math.round(RETRY_MIN_CANDIDATE_HASH)}% hash floor.`,
+    );
+    kept.sort((a, b) => b.confidence - a.confidence);
+    source = kept.map((segment): RankedCandidate => ({ segment }));
+  }
+
+  for (const cand of source) {
+    if (out.length >= RETRY_MAX_TOTAL_CANDIDATES) break;
+    if (out.some(existing => Math.abs(existing.segment.movieStart - cand.segment.movieStart) < 1)) {
+      continue;
+    }
+    out.push(cand);
+  }
+  return out;
+}
+
 /** Job-level fps/VFR metadata for the records, read once per verify pass.
  *  Best-effort: null whenever the probe file is absent or unreadable. */
 function loadVideoMetaForRecords(
