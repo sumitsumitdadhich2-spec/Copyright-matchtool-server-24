@@ -47,6 +47,16 @@ export interface CandidateRecord {
     /** 0..1 or null — agreement with the timeline the other segments form. */
     timelineScore: number | null;
   };
+  /** RETRY-only multi-signal scores (0..1 each) computed by the fresh
+   *  full-movie search over the candidate's consecutive-matching frame run.
+   *  Optional extra field — the on-disk record format stays fully compatible
+   *  with the main verification system, which simply ignores it. */
+  retrySignals?: {
+    structure: number;
+    color: number;
+    background: number;
+    humanEdge: number;
+  };
 }
 
 export interface VerificationRecord {

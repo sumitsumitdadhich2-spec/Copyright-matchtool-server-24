@@ -47,6 +47,14 @@ import {
 } from './store';
 import { flagTimelineOutliers, timelineConsistencyScore } from './timeline';
 import { readMatchVideoMetadata } from '../video-metadata';
+// RETRY-only fresh full-movie search (see fresh-search.ts). Never used by the
+// bulk pass; only recheckSegment (the manual Retry entry point) calls it.
+import {
+  freshSearchCandidates,
+  signalTier,
+  SIGNAL_THRESHOLD,
+  type FreshCandidate,
+} from './fresh-search';
 
 // ---------------------------------------------------------------------------
 // Tunables
@@ -84,6 +92,17 @@ const FALLBACK_CANDIDATE_HASH = clampNum(process.env.VERIFY_FALLBACK_CANDIDATE_H
  *  movie sliver "matching" a 2.12s clip) and is dropped from the candidate
  *  list. Applies to alternates only, never the engine pick. */
 const MIN_SPAN_RATIO = clampNum(process.env.VERIFY_MIN_SPAN_RATIO, 0.3, 0, 1);
+/** RETRY-only hash floor: a Retry candidate below this % hash confidence is
+ *  DROPPED outright; at/above it, the candidate goes to Gemini VLM which gives
+ *  the final verdict. Applies to fresh-search candidates AND pool fallbacks. */
+const RETRY_MIN_CANDIDATE_HASH = clampNum(process.env.RETRY_MIN_CANDIDATE_HASH, 75, 0, 100);
+/** RETRY-only cap on the total candidates a single Retry verifies. */
+const RETRY_MAX_TOTAL_CANDIDATES = clampInt(process.env.RETRY_MAX_CANDIDATES, 20, 1, 20);
+/** RETRY-only duration rule for pool-fallback candidates: the candidate's
+ *  speed-corrected movie span must cover at least this fraction of the target
+ *  clip's duration (a 0.20s candidate for a 2s clip cannot exist). Fresh-
+ *  search candidates are full-duration by construction. */
+const RETRY_MIN_DURATION_RATIO = clampNum(process.env.RETRY_MIN_DURATION_RATIO, 0.6, 0, 1);
 /** Ranges verified in parallel. Gemini's own RPM pacing lives in gemini-vlm.ts. */
 const CONCURRENCY = clampInt(process.env.VERIFY_CONCURRENCY, 2, 1, 8);
 /** A verdict below this confidence is not trusted either way. */
@@ -288,11 +307,17 @@ async function verifyOneRange(
    *  early stop. Among all Gemini-accepted candidates the one with the highest
    *  HASH confidence wins (same rule as the bulk pass). */
   checkAll = false,
+  /** RETRY-only: a pre-built candidate list (fresh full-movie search) that
+   *  replaces the pool-based collectCandidates. The bulk pass never sets it. */
+  presetCandidates?: RankedCandidate[],
 ): Promise<RangeOutcome> {
-  const candidates = collectCandidates(primary, req.candidatePool, neighbors);
+  const candidates = presetCandidates ?? collectCandidates(primary, req.candidatePool, neighbors);
   req.onLog?.(
-    `Collected ${candidates.length} candidate(s) for clip ${fmt(primary.shortStart)}s–${fmt(primary.shortEnd)}s ` +
-    `(engine pick + ${candidates.length - 1} alternate(s) from the candidate pool).`,
+    presetCandidates
+      ? `${candidates.length} candidate(s) queued for clip ${fmt(primary.shortStart)}s–${fmt(primary.shortEnd)}s ` +
+        `(current pick + ${candidates.length - 1} from the fresh full-movie search).`
+      : `Collected ${candidates.length} candidate(s) for clip ${fmt(primary.shortStart)}s–${fmt(primary.shortEnd)}s ` +
+        `(engine pick + ${candidates.length - 1} alternate(s) from the candidate pool).`,
   );
 
   const record: VerificationRecord = {
@@ -306,6 +331,7 @@ async function verifyOneRange(
       hashConfidence: c.segment.confidence,
       rankScore: c.rankScore,
       rankSignals: c.rankSignals,
+      retrySignals: c.retrySignals,
     })),
     dropped: false,
     videoMetadata: videoMeta,
@@ -518,6 +544,8 @@ interface RankedCandidate {
   segment: MatchedSegment;
   rankScore?: number;
   rankSignals?: NonNullable<CandidateRecord['rankSignals']>;
+  /** RETRY-only: the fresh search's 4-signal scores for this candidate. */
+  retrySignals?: NonNullable<CandidateRecord['retrySignals']>;
 }
 
 /**
@@ -748,8 +776,30 @@ export async function recheckSegment(req: RecheckRequest): Promise<RecheckResult
 
   console.log(`[Verify] Manual re-check requested for range ${req.segmentIndex}.`);
   req.onLog?.(
-    `Retry started — full check mode: every candidate gets its own Gemini verification; ` +
-    `among accepted candidates the highest HASH confidence wins.`,
+    `Retry started — FRESH full-movie re-search of the target clip, then a full check: ` +
+    `every surviving candidate gets its own Gemini verification and Gemini gives the final verdict.`,
+  );
+
+  // Retry rule 1: do NOT depend on the previous result — re-search the target
+  // clip against the ENTIRE reference movie from the fingerprint files.
+  // Falls back to the saved candidate pool only when fingerprints are gone.
+  const fresh = await freshSearchCandidates({
+    uploadDir: req.uploadDir,
+    matchJobId: req.matchJobId,
+    shortStart: req.segment.shortStart,
+    shortEnd: req.segment.shortEnd,
+    onLog: req.onLog,
+  });
+
+  const presetCandidates = buildRetryCandidates(
+    req.segment,
+    fresh?.candidates ?? null,
+    req.candidatePool,
+    req.onLog,
+  );
+  req.onLog?.(
+    `${presetCandidates.length} candidate(s) will be verified (max ${RETRY_MAX_TOTAL_CANDIDATES}) — ` +
+    `hash/signals only filtered and ordered them; Gemini VLM makes the final match/no-match decision on each.`,
   );
 
   const outcome = await verifyOneRange(
@@ -772,6 +822,8 @@ export async function recheckSegment(req: RecheckRequest): Promise<RecheckResult
     // (up to one Gemini call each) and the accepted candidate with the
     // highest HASH confidence wins. A deliberate quota trade-off.
     true,
+    // The fresh-search candidate list replaces the pool-based collection.
+    presetCandidates,
   );
 
   await writeRecordAsync(req.uploadDir, req.matchJobId, outcome.record);
