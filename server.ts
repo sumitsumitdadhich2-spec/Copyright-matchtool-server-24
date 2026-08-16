@@ -21,7 +21,6 @@ import { probeVideoMetadata, saveMatchVideoMetadata } from './server/video-metad
 import { getGeminiStatus, geminiConfigured } from './server/gemini-vlm';
 import {
   verifyMatchedSegments,
-  recheckSegment,
   readRecord,
   readAllRecords,
   deleteRecordsForJob,
@@ -29,6 +28,11 @@ import {
   flagTimelineOutliers,
   type VerifySummary,
 } from './server/verification';
+// RETRY candidate system — dedicated 1:1 copy of server/verification/ used
+// ONLY by the manual Retry endpoints (segment Retry + gap Retry), so future
+// Retry-only changes can never affect the main matching/candidate system.
+// Both copies share the same on-disk candidate records.
+import { recheckSegment as retryRecheckSegment } from './server/retry-verification';
 
 // ── Process-level safety net ────────────────────────────────────────────────
 // Long background jobs (2-hour-movie fingerprinting/matching) touch a huge
@@ -1599,7 +1603,7 @@ async function startServer() {
           `${freshFromPool.length} NEW candidate(s) discovered in the engine's candidate pool` +
           `${diskPool.length === 0 ? ' (no persisted pool for this job — older match, using known candidates only)' : ''}.`,
         );
-        const result = await recheckSegment({
+        const result = await retryRecheckSegment({
           segment: primarySegment,
           segmentIndex,
           candidatePool: mergedPool,
@@ -1729,7 +1733,7 @@ async function startServer() {
           `Gap Retry started for unmatched range ${shortStart.toFixed(2)}s–${shortEnd.toFixed(2)}s: ` +
           `${gapCandidates.length} candidate(s) discovered in the engine's saved candidate pool.`,
         );
-        const result = await recheckSegment({
+        const result = await retryRecheckSegment({
           segment: gapCandidates[0],
           segmentIndex,
           candidatePool: gapCandidates,
